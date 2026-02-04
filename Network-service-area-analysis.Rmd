@@ -1,0 +1,203 @@
+---
+title: "Network-service-area-analysis"
+author: "Rakib"
+date: "2026-02-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Required packages and library
+
+```{r}
+
+## Packages and library
+
+# install.packages("remotes")
+# remotes::install_github("walkerke/mapboxapi")
+
+library(mapboxapi)
+library(sf)
+library(tmap)
+library(tidycensus)
+library(dplyr)
+
+# Provide your mapbox-api here
+
+mb_access_token("Put your mapbox_api here", install = TRUE)
+
+```
+
+# Open the location/site data and convert in into spatial object
+
+```{r}
+# Here, we load the location data used to generate the network service area.
+# If you have a CSV or Excel file, convert it into an sf object using the sf package.
+# Since I already have the location data in sf format, no conversion was necessary.
+## Often, we need to select the projected coordinate system of the location data or reproject into another coordinate system---- dont forget this
+
+sites <-st_read("All_sites.shp")
+
+```
+
+## Now create the service area buffer using mapbox-function
+
+```{r}
+
+## Add Isochrone (20, 30, 45 min driving)
+
+iso <- mb_isochrone(
+  sites,
+  profile = "driving",
+  time = c(20,30,45)
+)
+st_crs(iso)
+st_crs(sites)
+
+## Reproject layer if needed
+## transform to Projected coordinate system 
+
+sites <- st_transform(sites, crs = 5070)
+iso <- st_transform(iso, crs = 5070)
+
+```
+
+## Visualise the data
+
+```{r}
+# Convert 'time' to factor for categorical mapping
+iso$time <- factor(iso$time, levels = c(20, 30, 45))
+
+# Visualize the Isochrome for existing sites
+
+my_colors <- c("20" = "green", "30" = "orange", "45" = "red")
+tmap_mode("plot")
+mapx <- tm_basemap("CartoDB.Positron")+
+  tm_shape(countyExis) +
+  tm_polygons(col = NA, 
+              border.col = "black", 
+              alpha = 0.2, 
+              lwd = 2) +
+  tm_text("County",
+          size = 0.8,
+          col = "black",
+          bg.color = "white",
+          bg.alpha = 0.7) +
+  tm_shape(isoExis) +
+  tm_polygons(
+    col = "time",
+    palette = my_colors,
+    style = "cat",               
+    alpha = 0.3,
+    border.col = NA,
+    title = "Travel Time (min)",
+    labels = c("20 min", "30 min", "45 min") 
+  ) +
+  tm_shape(sitesExis) +
+  tm_symbols(shape = 21, 
+             col = "blue", 
+             size = 0.5,
+             border.col = "white",
+             border.lwd = 1) +
+  tm_text("Name", 
+          size = 0.9, 
+          col = "darkblue",
+          bg.color = "white",
+          bg.alpha = 0.8,
+          ymod = 1.5) +
+  tm_scale_bar(
+    text.size = 0.7,
+    position = c("left", "bottom")
+  ) +
+  tm_compass(
+    type = "arrow",
+    position = c("right", "top"),
+    size = 2
+  ) +
+  tm_layout(
+    title = "Existing College Service Area",
+    title.size = 1.4,
+    legend.outside = TRUE,
+    legend.outside.position = "right",
+    frame = FALSE
+  )
+mapx
+
+# Save to local drive
+tmap_save(mapx, "Existing service_area_map.png", width = 10, height = 8, dpi = 600)
+
+
+```
+
+# Choose one sample site and intersect with census polygons to get estimated population 
+
+```{r}
+
+# Get population estimate for the Georgia, USA counties
+ga_counties <- c("Liberty", "Bryan", "Bulloch", "Candler", "Chatham", 
+                 "Effingham", "Evans", "Long", "McIntosh", "Screven", 
+                 "Tattnall", "Wayne")
+
+# Get census data for each county and count the population
+### A Census API key is required for the following process, which can be obtained by signing up
+ga_tracts <- get_acs(
+  geography = "tract",
+  variables = c(total_pop = "B01003_001"),
+  state = "GA",
+  county = ga_counties,
+  year = 2023,
+  survey = "acs5",
+  geometry = TRUE,
+  output = "wide"
+)
+
+ga_tracts <- st_transform(ga_tracts, crs = 5070)
+
+## Choose one site from the ISO object at the very beginning
+Site_1 <- iso[iso$id==1,]
+
+# Custom function
+
+calculate_buffer_population <- function(isochrones, tracts) {
+  if(st_crs(isochrones) != st_crs(tracts)) {
+    tracts <- st_transform(tracts, st_crs(isochrones))
+  }
+  
+  # Find intersecting tracts
+  intersected <- st_intersection(tracts, isochrones)
+  
+  # Calculate areas
+  intersected <- intersected %>%
+    mutate(
+      # Area of intersection
+      intersect_area = as.numeric(st_area(.)),
+      # Original tract area (need to get from original tracts)
+      tract_area = as.numeric(st_area(tracts[match(GEOID, tracts$GEOID), ])),
+      # Proportion of tract within buffer
+      area_proportion = intersect_area / tract_area,
+      # Estimated population (proportional to area overlap)
+      estimated_pop = total_popE * area_proportion
+    )
+  
+  return(intersected)
+}
+
+# Apply the function
+pop_by_buffer_site1 <- calculate_buffer_population(Site_1, ga_tracts)
+
+# Summarize population by travel time
+summary_pop_time_savannah <- pop_by_buffer_site1 %>%
+  st_drop_geometry() %>%
+  group_by(time) %>%
+  summarise(
+    n_tracts = n(),
+    total_population = sum(estimated_pop, na.rm = TRUE),
+    fully_contained = sum(area_proportion >= 0.99),
+    partially_contained = sum(area_proportion < 0.99)
+  )
+write_csv(summary_pop_time_savannah, "Summary_pop.csv")
+
+```
+
